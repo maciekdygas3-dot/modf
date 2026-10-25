@@ -34,6 +34,44 @@ java {
     targetCompatibility = JavaVersion.VERSION_21
 }
 
+package com.example.targethud.mixin;
+
+import com.example.targethud.ModuleManager;
+import net.minecraft.client.gui.hud.InGameHud;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(InGameHud.class)
+public class InGameHudMixin {
+
+    /** Chowa wanilijny celownik, gdy wlaczony jest nasz Crosshair. */
+    @Inject(method = "renderCrosshair", at = @At("HEAD"), cancellable = true, require = 0)
+    private void targethud$hideVanillaCrosshair(CallbackInfo ci) {
+        if (ModuleManager.CROSSHAIR.enabled) ci.cancel();
+    }
+}
+
+package com.example.targethud.mixin;
+
+import com.example.targethud.ModuleManager;
+import net.minecraft.client.render.GameRenderer;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(GameRenderer.class)
+public class GameRendererMixin {
+
+    /** Wylacza przechylanie kamery po otrzymaniu obrazen. */
+    @Inject(method = "tiltViewWhenHurt", at = @At("HEAD"), cancellable = true, require = 0)
+    private void targethud$noHurtCam(CallbackInfo ci) {
+        if (ModuleManager.NO_HURT_CAM.enabled) ci.cancel();
+    }
+}
+
 package com.example.targethud;
 
 import net.fabricmc.api.ClientModInitializer;
@@ -47,8 +85,12 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.util.ActionResult;
 import org.lwjgl.glfw.GLFW;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TargetHudMod implements ClientModInitializer {
+
+    public static final Logger LOGGER = LoggerFactory.getLogger("targethud");
 
     private static KeyBinding openGui;
 
@@ -118,6 +160,7 @@ import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.particle.ParticleTypes;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
@@ -145,6 +188,14 @@ public class Visuals {
     private static final List<KillFx> effects = new ArrayList<>();
     private static final List<SahurFx> sahurFx = new ArrayList<>();
 
+    // ---- stan Jump Circles / Target ESP ----
+    private static boolean renderErrorLogged;
+    private static boolean wasOnGround;
+    private static final List<RingFx> rings = new ArrayList<>();
+    private static LivingEntity espTarget;
+    private static long espSeen;
+    private static int espTicks;
+
     /** Wywolywane z AttackEntityCallback, gdy uderzasz byt. */
     public static void onHit(Entity e) {
         long now = System.currentTimeMillis();
@@ -158,6 +209,12 @@ public class Visuals {
         }
 
         MinecraftClient mc = MinecraftClient.getInstance();
+
+        if (ModuleManager.HIT_SOUNDS.enabled && mc.world != null && mc.player != null) {
+            mc.world.playSound(mc.player.getX(), mc.player.getY(), mc.player.getZ(),
+                    SoundEvents.ENTITY_ARROW_HIT_PLAYER, SoundCategory.PLAYERS, 0.8f, 1.4f, false);
+        }
+
         if (ModuleManager.HIT_PARTICLES.enabled && mc.world != null) {
             ThreadLocalRandom r = ThreadLocalRandom.current();
             for (int i = 0; i < 14; i++) {
@@ -190,15 +247,72 @@ public class Visuals {
                                 lastVictim.getZ(), lastVictim.getHeight()));
                     }
                     if (ModuleManager.SAHUR_KILL.enabled) {
-                        sahurFx.add(new SahurFx(mc, lastVictim));
+                        try {
+                            sahurFx.add(new SahurFx(mc, lastVictim));
+                        } catch (Throwable t) {
+                            TargetHudMod.LOGGER.warn("Sahur Kill: nie udalo sie utworzyc efektu", t);
+                            lastVictim.setInvisible(false);
+                        }
                     }
                 }
                 lastVictim = null;
             }
         }
 
-        effects.removeIf(fx -> fx.tick(mc.world));
-        sahurFx.removeIf(SahurFx::tick);
+        if (mc.player.hurtTime > 0) combo = 0; // combo konczy sie po otrzymaniu obrazen
+
+        // Jump Circles: pierscien czasteczek w momencie skoku
+        boolean onGround = mc.player.isOnGround();
+        if (ModuleManager.JUMP_CIRCLES.enabled && wasOnGround && !onGround
+                && mc.player.getVelocity().y > 0.1) {
+            rings.add(new RingFx(mc.player.getX(), mc.player.getY(), mc.player.getZ()));
+        }
+        wasOnGround = onGround;
+        try {
+            rings.removeIf(r -> r.tick(mc.world));
+        } catch (Throwable t) {
+            rings.clear();
+            TargetHudMod.LOGGER.warn("Jump Circles: blad efektu", t);
+        }
+
+        // Target ESP: obracajace sie czasteczki wokol celu
+        if (mc.targetedEntity instanceof LivingEntity le && le != mc.player
+                && !(le instanceof ArmorStandEntity)) {
+            espTarget = le;
+            espSeen = System.currentTimeMillis();
+        }
+        if (ModuleManager.TARGET_ESP.enabled && espTarget != null) {
+            if (!espTarget.isAlive() || System.currentTimeMillis() - espSeen > 3000) {
+                espTarget = null;
+            } else {
+                espTicks++;
+                double a = espTicks * 0.35;
+                double rad = espTarget.getWidth() * 0.9 + 0.2;
+                double yy = espTarget.getY() + (Math.sin(espTicks * 0.12) + 1) / 2 * espTarget.getHeight();
+                for (int s = 0; s < 2; s++) {
+                    double ang = a + s * Math.PI;
+                    mc.world.addParticle(ParticleTypes.END_ROD,
+                            espTarget.getX() + Math.cos(ang) * rad, yy,
+                            espTarget.getZ() + Math.sin(ang) * rad, 0, 0, 0);
+                }
+            }
+        }
+
+        try {
+            effects.removeIf(fx -> fx.tick(mc.world));
+        } catch (Throwable t) {
+            effects.clear();
+            TargetHudMod.LOGGER.warn("Kill Effect: blad efektu", t);
+        }
+        try {
+            sahurFx.removeIf(SahurFx::tick);
+        } catch (Throwable t) {
+            for (SahurFx f : sahurFx) {
+                try { f.cleanup(); } catch (Throwable ignored) { }
+            }
+            sahurFx.clear();
+            TargetHudMod.LOGGER.warn("Sahur Kill: blad efektu, wylaczono biezace efekty", t);
+        }
     }
 
     /** Wywolywane z HudRenderCallback. */
@@ -206,10 +320,36 @@ public class Visuals {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player == null || mc.options.hudHidden) return;
 
-        if (ModuleManager.WATERMARK.enabled) watermark(ctx, mc);
-        if (ModuleManager.HIT_MARKER.enabled) hitMarker(ctx);
-        if (ModuleManager.COMBO_COUNTER.enabled) comboCounter(ctx, mc);
-        if (ModuleManager.TARGET_HUD.enabled) targetHud(ctx, mc);
+        try {
+            if (ModuleManager.WATERMARK.enabled) watermark(ctx, mc);
+            if (ModuleManager.CROSSHAIR.enabled) crosshair(ctx, mc);
+            if (ModuleManager.HIT_MARKER.enabled) hitMarker(ctx);
+            if (ModuleManager.COMBO_COUNTER.enabled) comboCounter(ctx, mc);
+            if (ModuleManager.TARGET_HUD.enabled) targetHud(ctx, mc);
+        } catch (Throwable t) {
+            if (!renderErrorLogged) {
+                renderErrorLogged = true;
+                TargetHudMod.LOGGER.error("Blad renderowania HUD", t);
+            }
+        }
+    }
+
+    private static void crosshair(DrawContext ctx, MinecraftClient mc) {
+        int cx = ctx.getScaledWindowWidth() / 2, cy = ctx.getScaledWindowHeight() / 2;
+        int gap = 3, len = 5;
+        int col = mc.targetedEntity instanceof LivingEntity ? 0xFFFF4040 : 0xFFFFFFFF;
+        int sh = 0x90000000;
+
+        // cien
+        ctx.fill(cx - gap - len - 1, cy - 1, cx - gap + 1, cy + 2, sh);
+        ctx.fill(cx + gap, cy - 1, cx + gap + len + 1, cy + 2, sh);
+        ctx.fill(cx - 1, cy - gap - len - 1, cx + 2, cy - gap + 1, sh);
+        ctx.fill(cx - 1, cy + gap, cx + 2, cy + gap + len + 1, sh);
+        // kreski
+        ctx.fill(cx - gap - len, cy, cx - gap, cy + 1, col);
+        ctx.fill(cx + gap + 1, cy, cx + gap + len + 1, cy + 1, col);
+        ctx.fill(cx, cy - gap - len, cx + 1, cy - gap, col);
+        ctx.fill(cx, cy + gap + 1, cx + 1, cy + gap + len + 1, col);
     }
 
     private static void watermark(DrawContext ctx, MinecraftClient mc) {
@@ -243,7 +383,8 @@ public class Visuals {
     }
 
     private static void targetHud(DrawContext ctx, MinecraftClient mc) {
-        if (mc.targetedEntity instanceof LivingEntity le && le != mc.player) {
+        if (mc.targetedEntity instanceof LivingEntity le && le != mc.player
+                && !(le instanceof ArmorStandEntity)) {
             if (le != target) shownHealth = le.getHealth();
             target = le;
             targetSeen = System.currentTimeMillis();
@@ -283,6 +424,27 @@ public class Visuals {
     // ---------------------------------------------------------------
     // Prosty Kill Effect: wybuch + spirala czasteczek
     // ---------------------------------------------------------------
+    /** Rozszerzajacy sie pierscien czasteczek (Jump Circles). */
+    private static class RingFx {
+        private final double x, y, z;
+        private int age = 0;
+
+        RingFx(double x, double y, double z) {
+            this.x = x; this.y = y; this.z = z;
+        }
+
+        boolean tick(ClientWorld w) {
+            double radius = 0.4 + age * 0.14;
+            int n = 28;
+            for (int i = 0; i < n; i++) {
+                double a = 2 * Math.PI * i / n;
+                w.addParticle(ParticleTypes.END_ROD,
+                        x + Math.cos(a) * radius, y + 0.05, z + Math.sin(a) * radius, 0, 0, 0);
+            }
+            return ++age > 8;
+        }
+    }
+
     private static class KillFx {
         private final double x, y, z;
         private final float height;
@@ -331,17 +493,28 @@ import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.text.Text;
+import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
 import java.util.List;
 
 public class ClickGuiScreen extends Screen {
     private static final int PW = 130, ROW = 22, HEAD = 26, GAP = 10, TOP = 60;
+    private static final int ACCENT = 0xFF4C8DFF;
+
+    // pozycje paneli zapamietane na czas sesji (mozna je przeciagac)
+    private static final int[] PX = new int[Category.values().length];
+    private static final int[] PY = new int[Category.values().length];
+    private static boolean placed = false;
 
     private record Hit(int x, int y, int w, int h, Module m) {}
+    private record Head(int x, int y, int w, int h, int index) {}
 
     private final List<Hit> hits = new ArrayList<>();
+    private final List<Head> heads = new ArrayList<>();
     private TextFieldWidget search;
+    private long openedAt;
+    private int dragging = -1, dragOffX, dragOffY;
 
     public ClickGuiScreen() {
         super(Text.literal("Click GUI"));
@@ -349,57 +522,96 @@ public class ClickGuiScreen extends Screen {
 
     @Override
     protected void init() {
+        openedAt = System.currentTimeMillis();
         search = new TextFieldWidget(textRenderer, width - 190, 16, 160, 18, Text.literal("Search"));
         search.setPlaceholder(Text.literal("Type to filter..."));
         addDrawableChild(search);
+
+        if (!placed) {
+            int n = Category.values().length;
+            int x = (width - (n * PW + (n - 1) * GAP)) / 2;
+            for (int i = 0; i < n; i++) {
+                PX[i] = x + i * (PW + GAP);
+                PY[i] = TOP;
+            }
+            placed = true;
+        }
     }
 
     @Override
     public void render(DrawContext ctx, int mx, int my, float delta) {
         super.render(ctx, mx, my, delta); // rozmyte tlo + wyszukiwarka
         hits.clear();
+        heads.clear();
 
-        ctx.drawText(textRenderer, "aura", 24, 20, 0xFFFFFFFF, true);
-        ctx.drawText(textRenderer, "VISUALS", 24, 32, 0xFF8899BB, false);
+        // animacja otwarcia (wjazd + pojawienie sie)
+        float t = Math.min(1f, (System.currentTimeMillis() - openedAt) / 180f);
+        float ease = 1f - (1f - t) * (1f - t);
+        int slide = Math.round((1f - ease) * 14);
+
+        ctx.drawText(textRenderer, "aura", 24, 20, a(0xFFFFFFFF, ease), true);
+        ctx.drawText(textRenderer, "VISUALS", 24, 32, a(0xFF8899BB, ease), false);
 
         Category[] cats = Category.values();
-        int x = (width - (cats.length * PW + (cats.length - 1) * GAP)) / 2;
         String q = search.getText().toLowerCase();
 
-        for (Category c : cats) {
+        for (int i = 0; i < cats.length; i++) {
+            Category c = cats[i];
             List<Module> mods = ModuleManager.byCategory(c).stream()
                     .filter(m -> q.isEmpty() || m.name.toLowerCase().contains(q)).toList();
             int h = HEAD + mods.size() * ROW + 6;
 
-            ctx.fill(x, TOP, x + PW, TOP + h, 0xC0182236);
-            ctx.drawBorder(x, TOP, PW, h, 0x30FFFFFF);
-            ctx.drawText(textRenderer, c.label, x + 10, TOP + 9, 0xFFFFFFFF, true);
-            ctx.fill(x + 8, TOP + HEAD - 4, x + PW - 8, TOP + HEAD - 3, 0x25FFFFFF);
+            int x = Math.max(0, Math.min(PX[i], width - PW));
+            int y = Math.max(0, Math.min(PY[i], height - HEAD)) + slide;
 
-            int y = TOP + HEAD;
+            roundRect(ctx, x, y, PW, h, a(0xD0161F30, ease));
+            ctx.fill(x + 3, y, x + PW - 3, y + 1, a(ACCENT, ease)); // akcent u gory
+            ctx.drawText(textRenderer, c.label, x + 10, y + 9, a(0xFFFFFFFF, ease), true);
+            String cnt = String.valueOf(mods.size());
+            ctx.drawText(textRenderer, cnt, x + PW - 10 - textRenderer.getWidth(cnt), y + 9,
+                    a(0xFF6F7C96, ease), false);
+            ctx.fill(x + 8, y + HEAD - 4, x + PW - 8, y + HEAD - 3, a(0x25FFFFFF, ease));
+            heads.add(new Head(x, y, PW, HEAD, i));
+
+            int ry = y + HEAD;
             for (Module m : mods) {
-                boolean hover = mx >= x && mx < x + PW && my >= y && my < y + ROW;
-                if (hover) ctx.fill(x + 4, y, x + PW - 4, y + ROW - 2, 0x28FFFFFF);
+                boolean hover = dragging < 0 && mx >= x && mx < x + PW && my >= ry && my < ry + ROW;
+                if (hover) roundRect(ctx, x + 4, ry, PW - 8, ROW - 2, a(0x28FFFFFF, ease));
+                if (m.enabled) ctx.fill(x + 4, ry + 3, x + 6, ry + ROW - 5, a(ACCENT, ease));
 
-                ctx.drawText(textRenderer, m.name, x + 12, y + 7,
-                        m.enabled ? 0xFFFFFFFF : 0xFF8F9BB3, true);
+                ctx.drawText(textRenderer, m.name, x + 12, ry + 7,
+                        a(m.enabled ? 0xFFFFFFFF : 0xFF8F9BB3, ease), true);
 
+                // animowany przelacznik
                 m.anim += ((m.enabled ? 1f : 0f) - m.anim) * 0.25f;
-                int sx = x + PW - 36, sy = y + 5;
-                ctx.fill(sx, sy, sx + 24, sy + 10, lerp(0xFF3A4458, 0xFF4C8DFF, m.anim));
-                int kx = sx + 1 + Math.round(m.anim * 14);
-                ctx.fill(kx, sy + 1, kx + 8, sy + 9, 0xFFFFFFFF);
+                int sx = x + PW - 36, sy = ry + 5;
+                roundRect(ctx, sx, sy, 24, 10, a(lerp(0xFF3A4458, ACCENT, m.anim), ease));
+                int kx = sx + 2 + Math.round(m.anim * 12);
+                roundRect(ctx, kx, sy + 1, 8, 8, a(0xFFFFFFFF, ease));
 
-                hits.add(new Hit(x, y, PW, ROW, m));
-                y += ROW;
+                hits.add(new Hit(x, ry, PW, ROW, m));
+                ry += ROW;
             }
-            x += PW + GAP;
         }
+
+        ctx.drawCenteredTextWithShadow(textRenderer,
+                "Right Shift / ESC - zamknij   |   przeciagnij naglowek, zeby przesunac panel",
+                width / 2, height - 16, a(0xFF8899BB, ease));
     }
 
     @Override
     public boolean mouseClicked(double mx, double my, int button) {
         if (button == 0) {
+            for (Head hd : heads) {
+                if (mx >= hd.x() && mx < hd.x() + hd.w() && my >= hd.y() && my < hd.y() + hd.h()) {
+                    dragging = hd.index();
+                    PX[dragging] = hd.x();
+                    PY[dragging] = hd.y();
+                    dragOffX = (int) mx - hd.x();
+                    dragOffY = (int) my - hd.y();
+                    return true;
+                }
+            }
             for (Hit h : hits) {
                 if (mx >= h.x() && mx < h.x() + h.w() && my >= h.y() && my < h.y() + h.h()) {
                     h.m().toggle();
@@ -411,6 +623,31 @@ public class ClickGuiScreen extends Screen {
     }
 
     @Override
+    public boolean mouseDragged(double mx, double my, int button, double dx, double dy) {
+        if (dragging >= 0 && button == 0) {
+            PX[dragging] = (int) mx - dragOffX;
+            PY[dragging] = (int) my - dragOffY;
+            return true;
+        }
+        return super.mouseDragged(mx, my, button, dx, dy);
+    }
+
+    @Override
+    public boolean mouseReleased(double mx, double my, int button) {
+        dragging = -1;
+        return super.mouseReleased(mx, my, button);
+    }
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (keyCode == GLFW.GLFW_KEY_RIGHT_SHIFT && !search.isFocused()) {
+            close();
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    @Override
     public void removed() {
         ModuleManager.save();
     }
@@ -418,6 +655,21 @@ public class ClickGuiScreen extends Screen {
     @Override
     public boolean shouldPause() {
         return false;
+    }
+
+    /** Prostokat z lekko zaokraglonymi rogami (bez nakladajacych sie wypelnien). */
+    private static void roundRect(DrawContext c, int x, int y, int w, int h, int color) {
+        c.fill(x + 2, y, x + w - 2, y + h, color);
+        c.fill(x + 1, y + 1, x + 2, y + h - 1, color);
+        c.fill(x + w - 2, y + 1, x + w - 1, y + h - 1, color);
+        c.fill(x, y + 2, x + 1, y + h - 2, color);
+        c.fill(x + w - 1, y + 2, x + w, y + h - 2, color);
+    }
+
+    /** Mnozy przezroczystosc koloru przez f (0..1). */
+    private static int a(int color, float f) {
+        int al = Math.round(((color >>> 24) & 0xFF) * f);
+        return (al << 24) | (color & 0xFFFFFF);
     }
 
     private static int lerp(int a, int b, float t) {
@@ -445,23 +697,31 @@ import java.util.List;
 public class ModuleManager {
     public static final List<Module> MODULES = new ArrayList<>();
 
-    // dzialajace moduly
-    public static final Module TARGET_HUD    = add("Target HUD", Category.HUD, true);
+    // ---- Combat ----
     public static final Module HIT_MARKER    = add("Hit Marker", Category.COMBAT, true);
     public static final Module HIT_PARTICLES = add("Hit Particles", Category.COMBAT, true);
+    public static final Module TARGET_ESP    = add("Target ESP", Category.COMBAT, true);
     public static final Module KILL_EFFECT   = add("Kill Effect", Category.COMBAT, false);
     public static final Module SAHUR_KILL    = add("Sahur Kill", Category.COMBAT, true);
-    public static final Module COMBO_COUNTER = add("Combo Counter", Category.HUD, true);
+
+    // ---- HUD ----
+    public static final Module TARGET_HUD    = add("Target HUD", Category.HUD, true);
     public static final Module WATERMARK     = add("Watermark", Category.HUD, true);
+    public static final Module COMBO_COUNTER = add("Combo Counter", Category.HUD, true);
+    public static final Module CROSSHAIR     = add("Crosshair", Category.HUD, false);
+
+    // ---- Animations ----
+    public static final Module NO_HURT_CAM   = add("No Hurt Cam", Category.ANIMATIONS, false);
+
+    // ---- Sound ----
+    public static final Module HIT_SOUNDS    = add("Hit Sounds", Category.SOUND, true);
+
+    // ---- World ----
+    public static final Module JUMP_CIRCLES  = add("Jump Circles", Category.WORLD, true);
 
     static {
         // placeholdery, jeszcze bez funkcji
-        add("Target ESP", Category.COMBAT, false);
         add("Hit Color", Category.COMBAT, false);
-        add("Crosshair", Category.HUD, false);
-        add("Hurt Cam", Category.ANIMATIONS, false);
-        add("Hit Sounds", Category.SOUND, false);
-        add("Jump Circles", Category.WORLD, false);
         add("Fullbright", Category.WORLD, false);
         add("Cosmetics", Category.CLIENT, false);
         load();
@@ -683,6 +943,20 @@ public class SahurFx {
 }
 
 {
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.example.targethud.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "InGameHudMixin",
+    "GameRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
+
+{
   "schemaVersion": 1,
   "id": "targethud",
   "version": "${version}",
@@ -691,6 +965,7 @@ public class SahurFx {
   "authors": ["you"],
   "license": "MIT",
   "environment": "client",
+  "mixins": ["targethud.mixins.json"],
   "entrypoints": {
     "client": ["com.example.targethud.TargetHudMod"]
   },
@@ -738,6 +1013,29 @@ public class SahurFx {
   "category.targethud": "Target HUD"
 }
 
+name: build
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.12.1
+      - run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: targethud-mod
+          path: build/libs/*.jar
+
 # Target HUD (Fabric 1.21.4)
 
 Jeden mod: Click GUI (Prawy Shift), Target HUD, Hit Marker, Hit Particles,
@@ -769,6 +1067,16 @@ Mod jest kliencki, wiec dziala tez na serwerach bez moda.
 
 ## Sterowanie
 Prawy Shift: otwiera Click GUI. Ustawienia zapisuja sie w config/targethud.json.
+
+## Moduly (Prawy Shift)
+Dzialaja: Target HUD, Hit Marker, Hit Particles, Combo Counter, Watermark,
+Kill Effect, Sahur Kill, Hit Sounds, Crosshair, No Hurt Cam, Jump Circles, Target ESP.
+Placeholdery: Hit Color, Fullbright, Cosmetics.
+
+## Click GUI
+Panele mozna przeciagac za naglowek. Right Shift lub ESC zamyka menu.
+Efekty maja zabezpieczenia: jesli jakis efekt zglosi blad, zostanie wylaczony
+(blad trafi do logs/latest.log), zamiast zawieszac gre.
 
 org.gradle.jvmargs=-Xmx2G
 org.gradle.parallel=true
